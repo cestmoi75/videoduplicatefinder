@@ -17,6 +17,7 @@
 using VDF.Core;
 using VDF.Core.Utils;
 using VDF.Core.ViewModels;
+using VDF.Web.Models;
 
 namespace VDF.Web.Services {
 	public enum ScanState { Idle, Scanning, Comparing, Done, Aborted, Error }
@@ -142,6 +143,18 @@ namespace VDF.Web.Services {
 		}
 
 		public bool SaveSettings() => _settingsService.Save(_engine.Settings);
+
+		/// <summary>
+		/// Checks if the specified hardware acceleration mode is supported by FFmpeg
+		/// </summary>
+		public bool IsHardwareAccelerationSupported(VDF.Core.FFTools.FFHardwareAccelerationMode mode) =>
+			VDF.Core.FFTools.FfmpegEngine.IsHardwareAccelerationSupported(mode);
+
+		/// <summary>
+		/// Gets a list of all supported hardware acceleration modes
+		/// </summary>
+		public List<VDF.Core.FFTools.FFHardwareAccelerationMode> GetSupportedHardwareAccelerationModes() =>
+			VDF.Core.FFTools.FfmpegEngine.GetSupportedHardwareAccelerationModes();
 
 		public void Reset() {
 			if (State == ScanState.Scanning || State == ScanState.Comparing) return;
@@ -396,6 +409,27 @@ namespace VDF.Web.Services {
 			ScanEngine.ClearDatabase();
 			_engine.Duplicates.Clear();
 			Notify();
+		}
+
+		/// <summary>Loads the scan database and returns a view of its entries.</summary>
+		public async Task<IReadOnlyList<DatabaseEntryInfo>> GetDatabaseEntriesAsync() {
+			await ScanEngine.LoadDatabase();
+			return VDF.Core.Utils.DatabaseUtils.Database
+				.Select(entry => new DatabaseEntryInfo {
+					Path = entry.Path,
+					Folder = entry.Folder,
+					FileSize = entry.FileSize,
+					DateCreated = entry.DateCreated,
+					DateModified = entry.DateModified,
+					Flags = entry.Flags.ToString(),
+					IsManuallyExcluded = entry.IsManuallyExcluded,
+					HasMetadataError = entry.HasMetadataError,
+					HasThumbnailError = entry.HasThubmanilError,
+					GrayBytesCount = entry.grayBytes?.Count ?? 0,
+					PHashCount = entry.PHashes?.Count ?? 0,
+				})
+				.OrderBy(entry => entry.Path)
+				.ToList();
 		}
 
 		/// <summary>Number of file entries currently stored in the scan database.</summary>
