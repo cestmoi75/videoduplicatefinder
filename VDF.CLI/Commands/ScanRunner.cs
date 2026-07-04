@@ -35,7 +35,11 @@ namespace VDF.CLI.Commands {
 			engine.ScanAborted += OnAborted;
 			ct.Register(() => { engine.Stop(); tcs.TrySetCanceled(); });
 
-			engine.StartSearch();
+			// searchAndCompare:false — the CLI drives comparison as a separate awaitable step
+			// (RunCompareAsync). Letting StartSearch auto-chain into StartCompare would run the
+			// comparison twice, and the two concurrent SaveDatabase calls crash on the temp
+			// database file (#803).
+			engine.StartSearch(searchAndCompare: false);
 			await tcs.Task;
 
 			engine.BuildingHashesDone -= OnDone;
@@ -92,13 +96,6 @@ namespace VDF.CLI.Commands {
 			};
 		}
 
-		// Settings is field-heavy (ThumbnailCount, MaxSamplingDurationSeconds, etc. are
-		// public fields, not properties). System.Text.Json ignores fields by default —
-		// without IncludeFields the JSON load was silently dropping most settings.
-		static readonly JsonSerializerOptions SettingsJsonOptions = new() {
-			IncludeFields = true,
-			PropertyNameCaseInsensitive = true,
-		};
 
 		internal static Settings LoadOrCreateSettings(FileInfo? settingsFile) {
 			if (settingsFile == null || !settingsFile.Exists)
@@ -106,7 +103,7 @@ namespace VDF.CLI.Commands {
 
 			try {
 				var json = File.ReadAllText(settingsFile.FullName);
-				return JsonSerializer.Deserialize<Settings>(json, SettingsJsonOptions) ?? new Settings();
+				return JsonSerializer.Deserialize(json, VDF.Core.Utils.CoreJsonContext.Default.Settings) ?? new Settings();
 			}
 			catch (Exception ex) {
 				Console.Error.WriteLine($"Warning: could not load settings file '{settingsFile.FullName}': {ex.Message}");

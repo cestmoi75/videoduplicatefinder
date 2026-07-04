@@ -19,8 +19,6 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
 
 namespace VDF.Core.Utils {
 	static class GrayBytesUtils {
@@ -42,60 +40,6 @@ namespace VDF.Core.Utils {
 			return 100d / data.Length * darkPixels < darkProcent;
 		}
 
-		public static unsafe byte[]? GetGrayScaleValues(Image original, double darkPercent = 80) {
-
-			// CloneAs<L8> already produces a single-channel luminance image, so an additional
-			// .Grayscale() call only re-applies the BT.709 luma matrix to L=L=L, leaving values
-			// unchanged. Removing it skips a full Vector4 roundtrip per pixel of the resized image.
-			using var img = original.CloneAs<L8>();
-			img.Mutate(ctx => ctx.Resize(Side, Side));
-
-			byte[] buffer = new byte[GrayByteValueLength];
-
-			int dark = 0;
-			img.ProcessPixelRows(accessor =>
-			{
-				for (int y = 0; y < Side; y++) {
-					Span<L8> row = accessor.GetRowSpan(y);
-					int baseIdx = y * Side;
-					for (int x = 0; x < Side; x++) {
-						byte lum = row[x].PackedValue;
-						buffer[baseIdx + x] = lum;
-						if (lum <= BlackPixelLimit) dark++;
-					}
-				}
-			});
-
-			double darkP = 100d / GrayByteValueLength * dark;
-			return darkP >= darkPercent ? null : buffer;
-
-		}
-		public static unsafe byte[]? GetGrayScaleValues16x16(Image original, double darkPercent = 80) {
-			const int graybyteLength = 256;
-			// See GetGrayScaleValues — CloneAs<L8> already converts to grayscale; the
-			// subsequent .Grayscale() was a no-op on values, just wasted work.
-			using var img = original.CloneAs<L8>();
-			img.Mutate(ctx => ctx.Resize(OldSide, OldSide));
-
-			byte[] buffer = new byte[graybyteLength];
-
-			int dark = 0;
-			img.ProcessPixelRows(accessor => {
-				for (int y = 0; y < OldSide; y++) {
-					Span<L8> row = accessor.GetRowSpan(y);
-					int baseIdx = y * OldSide;
-					for (int x = 0; x < OldSide; x++) {
-						byte lum = row[x].PackedValue;
-						buffer[baseIdx + x] = lum;
-						if (lum <= BlackPixelLimit) dark++;
-					}
-				}
-			});
-
-			double darkP = 100d / graybyteLength * dark;
-			return darkP >= darkPercent ? null : buffer;
-
-		}
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
 		public static unsafe float PercentageDifferenceWithoutSpecificPixels(byte[] img1, byte[] img2, bool ignoreBlackPixels, bool ignoreWhitePixels) {
 			Debug.Assert(img1.Length == img2.Length, "Images must be of the same size");
@@ -122,11 +66,13 @@ namespace VDF.Core.Utils {
 				var whiteMinus1 = Vector256.Create((byte)(WhitePixelLimit - 1));
 				var zero = Vector256<byte>.Zero;
 
-				Vector256<ushort> diffVec = Vector256<ushort>.Zero;
-				Vector256<ushort> countVec = Vector256<ushort>.Zero;
+				// Int64-lane accumulators (see PercentageDifference) so neither the difference nor
+				// the surviving-pixel count can overflow the way a 16-bit accumulator would.
+				Vector256<long> diffVec = Vector256<long>.Zero;
+				Vector256<long> countVec = Vector256<long>.Zero;
 
-				Span<Vector256<byte>> vImg1 = MemoryMarshal.Cast<byte, Vector256<byte>>(img1);
-				Span<Vector256<byte>> vImg2 = MemoryMarshal.Cast<byte, Vector256<byte>>(img2);
+				Span<Vector256<byte>> vImg1 = MemoryMarshal.Cast<byte, Vector256<byte>>(img1.AsSpan());
+				Span<Vector256<byte>> vImg2 = MemoryMarshal.Cast<byte, Vector256<byte>>(img2.AsSpan());
 
 				for (int i = 0; i < vImg1.Length; i++) {
 					var v1 = vImg1[i];
@@ -152,11 +98,11 @@ namespace VDF.Core.Utils {
 
 					var v1Masked = Avx2.And(v1, validMask);
 					var v2Masked = Avx2.And(v2, validMask);
-					diffVec = Avx2.Add(diffVec, Avx2.SumAbsoluteDifferences(v1Masked, v2Masked));
-					countVec = Avx2.Add(countVec, Avx2.SumAbsoluteDifferences(validMask, zero));
+					diffVec = Avx2.Add(diffVec, Avx2.SumAbsoluteDifferences(v1Masked, v2Masked).AsInt64());
+					countVec = Avx2.Add(countVec, Avx2.SumAbsoluteDifferences(validMask, zero).AsInt64());
 				}
 
-				for (int i = 0; i < Vector256<ushort>.Count; i++) {
+				for (int i = 0; i < Vector256<long>.Count; i++) {
 					diff += diffVec.GetElement(i);
 					counter += countVec.GetElement(i);
 				}
@@ -183,26 +129,32 @@ namespace VDF.Core.Utils {
 			Debug.Assert(img1.Length == img2.Length, "Images must be of the same size");
 			long diff = 0;
 			if (Avx2.IsSupported) {
-				Vector256<ushort> vec = Vector256<ushort>.Zero;
-				Span<Vector256<byte>> vImg1 = MemoryMarshal.Cast<byte, Vector256<byte>>(img1);
-				Span<Vector256<byte>> vImg2 = MemoryMarshal.Cast<byte, Vector256<byte>>(img2);
+				// PSADBW emits each 8-byte SAD (≤ 8*255 = 2040) into its own 64-bit lane. Accumulate
+				// those into a Vector256<long> so the running total can never overflow, whatever the
+				// buffer size. A 16-bit accumulator wrapped once the per-lane sum passed 65535 — at
+				// 32x32 = 1024 bytes that overflowed on the SSE2 path and reported wildly different
+				// images as near-identical (#810); Int64 lanes remove the failure mode entirely.
+				Vector256<long> acc = Vector256<long>.Zero;
+				Span<Vector256<byte>> vImg1 = MemoryMarshal.Cast<byte, Vector256<byte>>(img1.AsSpan());
+				Span<Vector256<byte>> vImg2 = MemoryMarshal.Cast<byte, Vector256<byte>>(img2.AsSpan());
 
 				for (int i = 0; i < vImg1.Length; i++)
-					vec = Avx2.Add(vec, Avx2.SumAbsoluteDifferences(vImg2[i], vImg1[i]));
+					acc = Avx2.Add(acc, Avx2.SumAbsoluteDifferences(vImg2[i], vImg1[i]).AsInt64());
 
-				for (int i = 0; i < Vector256<ushort>.Count; i++)
-					diff += Math.Abs(vec.GetElement(i));
+				diff = acc.GetElement(0) + acc.GetElement(1) + acc.GetElement(2) + acc.GetElement(3);
 			}
 			else if (Sse2.IsSupported) {
-				Vector128<ushort> vec = Vector128<ushort>.Zero;
-				Span<Vector128<byte>> vImg1 = MemoryMarshal.Cast<byte, Vector128<byte>>(img1);
-				Span<Vector128<byte>> vImg2 = MemoryMarshal.Cast<byte, Vector128<byte>>(img2);
+				// Same overflow-proof Int64-lane accumulation as the AVX2 path (PSADBW puts two SAD
+				// results in 64-bit lanes 0 and 1 here). The previous Vector128<ushort> accumulator
+				// overflowed for dissimilar 1024-byte pairs and was the actual #810 bug.
+				Vector128<long> acc = Vector128<long>.Zero;
+				Span<Vector128<byte>> vImg1 = MemoryMarshal.Cast<byte, Vector128<byte>>(img1.AsSpan());
+				Span<Vector128<byte>> vImg2 = MemoryMarshal.Cast<byte, Vector128<byte>>(img2.AsSpan());
 
 				for (int i = 0; i < vImg1.Length; i++)
-					vec = Sse2.Add(vec, Sse2.SumAbsoluteDifferences(vImg2[i], vImg1[i]));
+					acc = Sse2.Add(acc, Sse2.SumAbsoluteDifferences(vImg2[i], vImg1[i]).AsInt64());
 
-				for (int i = 0; i < Vector128<ushort>.Count; i++)
-					diff += Math.Abs(vec.GetElement(i));
+				diff = acc.GetElement(0) + acc.GetElement(1);
 			}
 			else {
 				for (int i = 0; i < img1.Length; i++)
@@ -225,7 +177,7 @@ namespace VDF.Core.Utils {
 
 			if (Avx2.IsSupported && (side % 32) == 0) {
 				// line by line: two 16-byte shuffles per 32-byte block + swap of halves
-				var shuf = MemoryMarshal.Cast<byte, Vector128<byte>>(shuffle16)[0];
+				var shuf = MemoryMarshal.Cast<byte, Vector128<byte>>(shuffle16.AsSpan())[0];
 
 				for (int y = 0; y < side; y++) {
 					int rowBase = y * side;
@@ -271,43 +223,6 @@ namespace VDF.Core.Utils {
 				t.Reverse();
 				return Unsafe.ReadUnaligned<Vector128<byte>>(ref t[0]);
 			}
-		}
-
-
-
-		readonly static byte[] flipp_shuf256 = {
-				15,14,13,12,11,10, 9, 8,   7, 6, 5, 4, 3, 2, 1, 0,
-				31,30,29,28,27,26,25,24,  23,22,21,20,19,18,17,16
-		};
-
-		[MethodImpl(MethodImplOptions.AggressiveInlining)]
-		public static byte[] FlipGrayScale16x16(byte[] img) {
-			Debug.Assert((img.Length % 16) == 0, "Invalid img.Length");
-			byte[] flip_img;
-			if (Avx2.IsSupported) {
-				flip_img = new byte[img.Length];
-				Span<Vector256<byte>> vImg = MemoryMarshal.Cast<byte, Vector256<byte>>(img);
-				Span<Vector256<byte>> vImg_flipped = MemoryMarshal.Cast<byte, Vector256<byte>>(flip_img);
-				Span<Vector256<byte>> vFlipp_shuf = MemoryMarshal.Cast<byte, Vector256<byte>>(flipp_shuf256);
-
-				for (int i = 0; i < vImg.Length; i++)
-					vImg_flipped[i] = Avx2.Shuffle(vImg[i], vFlipp_shuf[0]);
-			}
-			else if (Sse3.IsSupported) {
-				flip_img = new byte[img.Length];
-				Span<Vector128<byte>> vImg = MemoryMarshal.Cast<byte, Vector128<byte>>(img);
-				Span<Vector128<byte>> vImg_flipped = MemoryMarshal.Cast<byte, Vector128<byte>>(flip_img);
-				Span<Vector128<byte>> vFlipp_shuf = MemoryMarshal.Cast<byte, Vector128<byte>>(flipp_shuf256);
-
-				for (int i = 0; i < vImg.Length; i++)
-					vImg_flipped[i] = Ssse3.Shuffle(vImg[i], vFlipp_shuf[0]);
-			}
-			else {
-				flip_img = (byte[])img.Clone();
-				for (int i = 0; i < 16; i++)
-					Array.Reverse(flip_img, i * 16, 16);
-			}
-			return flip_img;
 		}
 	}
 }

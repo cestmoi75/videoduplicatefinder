@@ -67,11 +67,23 @@ namespace VDF.GUI.Views {
 				Environment.OSVersion.Version.Build >= 22000) {
 				Background = null;
 				TransparencyLevelHint = new List<WindowTransparencyLevel> { WindowTransparencyLevel.Mica };
-				ExtendClientAreaChromeHints = Avalonia.Platform.ExtendClientAreaChromeHints.PreferSystemChrome;
+				// Avalonia 12: ExtendClientAreaChromeHints was removed; WindowDecorations.Full
+				// (system chrome) is the default, matching the old PreferSystemChrome behavior.
 				if (SettingsFile.Instance.DarkMode)
 					this.FindControl<ExperimentalAcrylicBorder>("ExperimentalAcrylicBorderBackgroundBlack")!.IsVisible = true;
 				else
 					this.FindControl<ExperimentalAcrylicBorder>("ExperimentalAcrylicBorderBackgroundWhite")!.IsVisible = true;
+			}
+
+			// GNOME (and other Linux compositors) keep their server-side title bar even when
+			// ExtendClientAreaToDecorationsHint is set, so VDF's own centered title rendered a
+			// second time just below the decoration (#798). Fall back to native decorations on
+			// Linux and drop both the in-window title and the gap reserved for the extended
+			// caption area. Windows/macOS keep the custom chrome.
+			if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) {
+				ExtendClientAreaToDecorationsHint = false;
+				this.FindControl<TextBlock>("TextBlockWindowTitle")!.IsVisible = false;
+				this.FindControl<Grid>("MainContentGrid")!.Margin = new Thickness(2, 2, 2, 2);
 			}
 
 			if (!SettingsFile.Instance.DarkMode)
@@ -83,9 +95,6 @@ namespace VDF.GUI.Views {
 					RequestedThemeVariant = SettingsFile.Instance.DarkMode ? ThemeVariant.Dark : ThemeVariant.Light;
 			};
 
-			if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) {
-				this.FindControl<TextBlock>("TextBlockWindowTitle")!.IsVisible = false;
-			}
 			ShowAlgoView();
 		}
 
@@ -115,8 +124,78 @@ namespace VDF.GUI.Views {
 				Height = 750d;
 			}
 
+			ApplySavedWindowPlacement();
+
 			ApplyKeyboardShortcuts();
 			KeyboardShortcutManager.Instance.ShortcutsChanged += ApplyKeyboardShortcuts;
+
+			HideOwnTitleIfChromeDrawsOne();
+		}
+
+		/// <summary>
+		/// Avalonia draws managed window decorations — including a centered title —
+		/// whenever the client area is extended (always on Linux; on Windows since
+		/// Avalonia 12 removed PreferSystemChrome). The app's own title TextBlock then
+		/// duplicates it. Detect the drawn title instead of hardcoding platforms so
+		/// each OS keeps exactly one title. The decorations attach asynchronously
+		/// (after Opened — a single deferred check missed them), so probe on the
+		/// first layout passes and stop once found or after a few attempts.
+		/// </summary>
+		void HideOwnTitleIfChromeDrawsOne() {
+			int attempts = 0;
+			void Check(object? sender, EventArgs e) {
+				bool chromeTitleVisible = this.GetVisualDescendants()
+					.Any(c => c is Control { Name: "PART_TitleTextPanel", IsVisible: true });
+				if (chromeTitleVisible) {
+					this.FindControl<TextBlock>("TextBlockWindowTitle")!.IsVisible = false;
+					LayoutUpdated -= Check;
+				}
+				else if (++attempts >= 30) {
+					LayoutUpdated -= Check; // no managed chrome on this platform/config
+				}
+			}
+			LayoutUpdated += Check;
+			Check(null, EventArgs.Empty);
+		}
+
+		void ApplySavedWindowPlacement() {
+			var settings = SettingsFile.Instance;
+			if (settings.MainWindowWidth is double savedWidth && savedWidth > 0)
+				Width = savedWidth;
+			if (settings.MainWindowHeight is double savedHeight && savedHeight > 0)
+				Height = savedHeight;
+
+			if (settings.MainWindowPositionX.HasValue && settings.MainWindowPositionY.HasValue && Screens != null) {
+				// Only restore a position that is still on a connected screen — a saved
+				// position on a since-removed monitor would open the window off-screen.
+				var saved = new PixelPoint(settings.MainWindowPositionX.Value, settings.MainWindowPositionY.Value);
+				var screen = Screens.ScreenFromPoint(new PixelPoint(
+					saved.X + (int)Math.Round(Width / 2), saved.Y + (int)Math.Round(Height / 2)));
+				if (screen != null) {
+					var workingArea = screen.WorkingArea;
+					int maxX = Math.Max(workingArea.X, workingArea.Right - (int)Math.Ceiling(Width));
+					int maxY = Math.Max(workingArea.Y, workingArea.Bottom - (int)Math.Ceiling(Height));
+					Position = new PixelPoint(
+						Math.Clamp(saved.X, workingArea.X, maxX),
+						Math.Clamp(saved.Y, workingArea.Y, maxY));
+				}
+			}
+
+			if (settings.MainWindowMaximized)
+				WindowState = WindowState.Maximized;
+		}
+
+		void SaveWindowPlacement() {
+			var settings = SettingsFile.Instance;
+			settings.MainWindowMaximized = WindowState == WindowState.Maximized;
+			// Size/position are only meaningful in the normal state; keep the last
+			// normal-state values when closing maximized or minimized.
+			if (WindowState == WindowState.Normal) {
+				settings.MainWindowWidth = Width;
+				settings.MainWindowHeight = Height;
+				settings.MainWindowPositionX = Position.X;
+				settings.MainWindowPositionY = Position.Y;
+			}
 		}
 
 		void ApplyKeyboardShortcuts() {
@@ -141,12 +220,15 @@ namespace VDF.GUI.Views {
 				["RemoveCheckedItemsFromList"] = vm.RemoveCheckedItemsFromListCommand,
 				["NavigateNextGroup"] = vm.NavigateNextGroupCommand,
 				["NavigatePreviousGroup"] = vm.NavigatePreviousGroupCommand,
+				["KeepHighlightedAndAdvance"] = vm.KeepHighlightedAndAdvanceCommand,
+				["UndoSelection"] = vm.UndoSelectionCommand,
 			};
 			var dataGrid = this.FindControl<DataGrid>("dataGridGrouping")!;
 			KeyboardShortcutManager.Instance.ApplyBindings(dataGrid, commandMap);
 		}
 
 		void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e) {
+			SaveWindowPlacement();
 			e.Cancel = true;
 			ConfirmClose();
 		}
@@ -178,6 +260,13 @@ namespace VDF.GUI.Views {
 				e.DragEffects = DragDropEffects.None;
 		}
 
+		// Only offer "Open In Folder" when the right-clicked log line actually
+		// resolves to a file/folder that exists; otherwise suppress the menu.
+		private void LogContextMenu_Opening(object? sender, System.ComponentModel.CancelEventArgs e) {
+			if (DataContext is MainWindowVM vm && MainWindowVM.TryExtractExistingPath(vm.SelectedLogItem) == null)
+				e.Cancel = true;
+		}
+
 		private void DropInclude(object? sender, DragEventArgs e) {
 			if (!e.DataTransfer.Contains(DataFormat.File)) return;
 
@@ -198,8 +287,8 @@ namespace VDF.GUI.Views {
 				if (fold == null)
 					continue;
 				string? localPath = fold.TryGetLocalPath();
-				if (!string.IsNullOrEmpty(localPath) && !SettingsFile.Instance.Includes.Contains(localPath))
-					SettingsFile.Instance.Includes.Add(localPath);
+				if (!string.IsNullOrEmpty(localPath) && !SettingsFile.Instance.Blacklists.Contains(localPath))
+					SettingsFile.Instance.Blacklists.Add(localPath);
 			}
 		}
 
@@ -219,6 +308,8 @@ namespace VDF.GUI.Views {
 			// Avoid adding buttons twice (recycled headers)
 			if (header.Tag is true) return;
 			header.Tag = true;
+			// The summary below replaces the raw key; "ItemInfo.GroupId:" adds nothing.
+			header.IsPropertyNameVisible = false;
 
 			var vm = ApplicationHelpers.MainWindowDataContext;
 
@@ -250,6 +341,22 @@ namespace VDF.GUI.Views {
 				Children = { compareBtn, keepBestBtn }
 			};
 
+			// Shown in place of the raw GroupId GUID ("4 files · 3.2 GB").
+			var summaryText = new TextBlock { VerticalAlignment = VerticalAlignment.Center };
+			void UpdateHeaderSummary() {
+				if (header.DataContext is not Avalonia.Collections.DataGridCollectionViewGroup g) return;
+				int count = 0;
+				long totalSize = 0;
+				foreach (var item in g.Items.OfType<DuplicateItemVM>()) {
+					count++;
+					if (item.ItemInfo.SizeLong > 0)
+						totalSize += item.ItemInfo.SizeLong;
+				}
+				summaryText.Text = string.Format(App.Lang["GroupHeader.Summary"], count, totalSize.BytesToString());
+			}
+			// Recycled headers keep our injected controls but get a new group.
+			header.DataContextChanged += (_, _) => UpdateHeaderSummary();
+
 			// Inject buttons into the header's visual tree once it's loaded
 			header.Loaded += (_, _) => {
 				// Walk visual tree to find the root Grid and append our button panel
@@ -259,6 +366,19 @@ namespace VDF.GUI.Views {
 					Grid.SetColumn(panel, grid.ColumnDefinitions.Count - 1);
 					grid.Children.Add(panel);
 				}
+				// Swap the GUID key TextBlock for the human-readable summary. The key
+				// element has no template part name, so it's located by its current text.
+				if (summaryText.Parent == null &&
+					header.DataContext is Avalonia.Collections.DataGridCollectionViewGroup g) {
+					string key = g.Key?.ToString() ?? string.Empty;
+					var keyText = header.GetVisualDescendants().OfType<TextBlock>()
+						.FirstOrDefault(tb => tb.Text == key);
+					if (keyText != null && keyText.Parent is Panel keyPanel) {
+						keyText.IsVisible = false;
+						keyPanel.Children.Insert(keyPanel.Children.IndexOf(keyText) + 1, summaryText);
+					}
+				}
+				UpdateHeaderSummary();
 			};
 		}
 
