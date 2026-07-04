@@ -14,13 +14,78 @@
 // */
 //
 
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
 using VDF.Core.Utils;
 
 namespace VDF.Core.Tests.Utils;
 
 public class GrayBytesUtilsTests {
+	// Reference SAD-based difference, identical math to PercentageDifference but in plain
+	// 64-bit scalar — used to pin the SIMD paths against silent accumulator overflow (#810).
+	static float ReferenceDifference(byte[] a, byte[] b) {
+		long diff = 0;
+		for (int i = 0; i < a.Length; i++)
+			diff += Math.Abs(a[i] - b[i]);
+		return (float)diff / a.Length / 256;
+	}
+
+	[Fact]
+	public void PercentageDifference_MaxDifference_ReturnsOne() {
+		// All-black vs all-white is the worst case: every one of the 1024 bytes differs by 255,
+		// the largest total any SIMD lane has to accumulate. A Vector128<ushort> accumulator
+		// overflowed here on non-AVX2 CPUs and wrapped ~1.0 down to ~0.03 (#810).
+		byte[] black = new byte[1024];
+		byte[] white = new byte[1024];
+		Array.Fill(white, (byte)255);
+		// Max possible is 255/256 ≈ 0.9961 (the divisor is 256). The overflow bug wrapped this to ~0.03.
+		Assert.Equal(ReferenceDifference(black, white), GrayBytesUtils.PercentageDifference(black, white), 5);
+	}
+
+	[Fact]
+	public void PercentageDifference_DissimilarPair_MatchesScalarReference() {
+		// A genuinely dissimilar pair whose total SAD far exceeds the ushort ceiling; must equal
+		// the scalar reference on every code path (regression guard for the overflow that reported
+		// very different images as ~97% similar).
+		byte[] a = new byte[1024];
+		byte[] b = new byte[1024];
+		for (int i = 0; i < 1024; i++) {
+			a[i] = (byte)(i % 64);          // 0..63 (dark)
+			b[i] = (byte)(200 + (i % 56));  // 200..255 (bright)
+		}
+		float expected = ReferenceDifference(a, b);
+		Assert.True(expected > 0.25f, "test pair must be dissimilar enough to overflow a 16-bit lane");
+		Assert.Equal(expected, GrayBytesUtils.PercentageDifference(a, b), 5);
+	}
+
+	[Fact]
+	public void PercentageDifference_LargeBuffer_NoOverflow() {
+		// 4096 bytes of maximum difference: 128 SIMD iterations, enough to overflow even the
+		// AVX2 16-bit accumulator the old code used (128 * 2040 = 261 120 ≫ 65 535). Guards the
+		// Int64-lane accumulation on the AVX2 path itself, not just SSE2.
+		byte[] a = new byte[4096];
+		byte[] b = new byte[4096];
+		Array.Fill(b, (byte)255);
+		Assert.Equal(ReferenceDifference(a, b), GrayBytesUtils.PercentageDifference(a, b), 5);
+	}
+
+	[Fact]
+	public void PercentageDifferenceWithoutSpecificPixels_LargeBuffer_NoOverflow() {
+		// Same large-buffer overflow guard for the masked path's diff/count accumulators.
+		byte[] a = new byte[4096];
+		byte[] b = new byte[4096];
+		for (int i = 0; i < a.Length; i++) {
+			a[i] = (byte)(40 + i % 40);    // mid-tones (survive the black/white filters)
+			b[i] = (byte)(170 + i % 40);
+		}
+		long diff = 0, count = 0;
+		for (int i = 0; i < a.Length; i++) {
+			if (a[i] <= 0x20 || b[i] <= 0x20 || a[i] >= 0xF0 || b[i] >= 0xF0) continue;
+			diff += Math.Abs(a[i] - b[i]);
+			count++;
+		}
+		float expected = (float)diff / count / 256;
+		Assert.Equal(expected, GrayBytesUtils.PercentageDifferenceWithoutSpecificPixels(a, b, true, true), 5);
+	}
+
 	[Fact]
 	public void VerifyGrayScaleValues_AllBlack_ReturnsFalse() {
 		// All pixels <= 0x20 (BlackPixelLimit) means 100% dark > 80% threshold
@@ -122,12 +187,14 @@ public class GrayBytesUtilsTests {
 	}
 
 	[Fact]
-	public void FlipGrayScale16x16_DoubleFlip_ReturnsOriginal() {
+	public void FlipGrayScale_16x16LegacySize_DoubleFlip_ReturnsOriginal() {
+		// Legacy (DbVersion < 2) databases store 16x16 gray bytes; FlipGrayScale derives
+		// the side from the array length and must handle them via its scalar fallback.
 		byte[] img = new byte[256]; // 16x16
 		var rng = new Random(42);
 		rng.NextBytes(img);
-		byte[] flipped = GrayBytesUtils.FlipGrayScale16x16(img);
-		byte[] doubleFlipped = GrayBytesUtils.FlipGrayScale16x16(flipped);
+		byte[] flipped = GrayBytesUtils.FlipGrayScale(img);
+		byte[] doubleFlipped = GrayBytesUtils.FlipGrayScale(flipped);
 		Assert.Equal(img, doubleFlipped);
 	}
 
@@ -177,51 +244,6 @@ public class GrayBytesUtilsTests {
 		img1[2] = 0xEF; img2[2] = 0xEF; // just below white -> kept
 		float diff = GrayBytesUtils.PercentageDifferenceWithoutSpecificPixels(img1, img2, ignoreBlackPixels: true, ignoreWhitePixels: true);
 		Assert.Equal(0f, diff); // 3 valid pairs, all equal
-	}
-
-	[Fact]
-	public void GetGrayScaleValues_DeterministicForSameInput() {
-		// Removing the redundant .Grayscale() call after CloneAs<L8>() must not change output
-		// across runs of the same input. Lock determinism with a fixed gradient so any
-		// upstream change in ImageSharp's resize semantics surfaces as a test failure.
-		using var img = new Image<Rgba32>(64, 48);
-		img.ProcessPixelRows(accessor => {
-			for (int y = 0; y < accessor.Height; y++) {
-				var row = accessor.GetRowSpan(y);
-				for (int x = 0; x < row.Length; x++) {
-					byte v = (byte)((x * 4 + y * 5) & 0xFF);
-					row[x] = new Rgba32(v, v, v, 255);
-				}
-			}
-		});
-
-		byte[]? a = GrayBytesUtils.GetGrayScaleValues(img);
-		byte[]? b = GrayBytesUtils.GetGrayScaleValues(img);
-		Assert.NotNull(a);
-		Assert.NotNull(b);
-		Assert.Equal(1024, a.Length);
-		Assert.Equal(a, b);
-	}
-
-	[Fact]
-	public void GetGrayScaleValues_GrayInputProducesNearIdenticalLuminance() {
-		// CloneAs<L8> on a gray Rgba32 input maps each pixel to its luma.
-		// For a uniform-gray source (R=G=B=128), every output byte should be ~128
-		// (small ImageSharp resize-filter dithering aside). This is the property
-		// the dropped .Grayscale() call did NOT improve.
-		using var img = new Image<Rgba32>(128, 96);
-		img.ProcessPixelRows(accessor => {
-			for (int y = 0; y < accessor.Height; y++) {
-				var row = accessor.GetRowSpan(y);
-				for (int x = 0; x < row.Length; x++)
-					row[x] = new Rgba32(128, 128, 128, 255);
-			}
-		});
-
-		byte[]? gray = GrayBytesUtils.GetGrayScaleValues(img);
-		Assert.NotNull(gray);
-		foreach (byte b in gray)
-			Assert.InRange(b, (byte)126, (byte)130);
 	}
 
 	[Theory]

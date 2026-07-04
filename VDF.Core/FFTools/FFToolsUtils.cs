@@ -14,6 +14,7 @@
 // */
 //
 
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using VDF.Core.Utils;
 
@@ -44,14 +45,14 @@ namespace VDF.Core.FFTools {
 			var toolPath = Path.Combine(CoreUtils.CurrentFolder, "bin", toolExecutable);
 			if (File.Exists(toolPath))
 				return toolPath;
-			
+
 			toolPath = Path.Combine(CoreUtils.CurrentFolder, toolExecutable);
 			if (File.Exists(toolPath))
 				return toolPath;
 
-			var environmentVariables = Environment.GetEnvironmentVariable("PATH")?.Split(Path.PathSeparator);
-			if (environmentVariables != null) {
-				foreach (var path in environmentVariables) {
+			static string? ScanPathDirs(string? pathVariable, string toolExecutable) {
+				if (pathVariable == null) return null;
+				foreach (var path in pathVariable.Split(Path.PathSeparator)) {
 					if (!Directory.Exists(path))
 						continue;
 
@@ -70,6 +71,23 @@ namespace VDF.Core.FFTools {
 #endif
 					}
 				}
+				return null;
+			}
+
+			toolPath = ScanPathDirs(Environment.GetEnvironmentVariable("PATH"), toolExecutable);
+			if (toolPath != null)
+				return toolPath;
+
+			// The process PATH is a snapshot taken when the app was launched. On Windows an
+			// FFmpeg installed afterwards (winget/scoop/choco or a manual PATH edit) shows up
+			// in new consoles but not here, so users see "ffmpeg -version" work while VDF
+			// keeps reporting it missing (issue #788). Re-read the registry-backed user and
+			// machine PATH, which is always current.
+			if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
+				toolPath = ScanPathDirs(Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User), toolExecutable)
+					?? ScanPathDirs(Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.Machine), toolExecutable);
+				if (toolPath != null)
+					return toolPath;
 			}
 
 			// A GUI app launched from Finder (macOS) or a desktop launcher (Linux) can inherit
@@ -89,13 +107,61 @@ namespace VDF.Core.FFTools {
 			return null;
 		}
 
+		// Windows MAX_PATH: paths at or beyond this length need the extended-length
+		// "\\?\" prefix to be opened. Shorter paths are passed through verbatim.
+		const int WindowsMaxPath = 260;
+
 		/// <summary>
-		/// Returns a path with long path prefix
+		/// On Windows, prefixes the path with the extended-length "\\?\" form when (and only
+		/// when) it is long enough to require it. Other platforms return the path unchanged.
 		/// </summary>
+		/// <remarks>
+		/// The prefix is applied conditionally on purpose. It contains a '?', which FFmpeg's
+		/// image2 demuxer treats as a glob/sequence metacharacter, so prefixing every path made
+		/// still images fail to open ("Could not open file" / "Could find no file or sequence",
+		/// #806). Only paths that actually exceed MAX_PATH need the prefix; normal-length paths
+		/// (the overwhelming majority) are now handed to FFmpeg as-is and open correctly.
+		/// </remarks>
 		/// <param name="path">Path of the file</param>
-		/// <returns>On Windows: path with long path prefix. Otherwise same as input</returns>
+		/// <returns>On Windows: long paths get the "\\?\" prefix. Otherwise same as input.</returns>
+		/// <summary>
+		/// Runs <c>&lt;tool&gt; -version</c> and returns its first output line (the
+		/// "ffmpeg version …" banner), or a short diagnostic string if the tool is missing
+		/// or could not be run. Used by the GUI diagnostics report for bug submissions.
+		/// </summary>
+		internal static string GetToolVersionLine(FFTool tool) {
+			string? path = GetPath(tool);
+			if (string.IsNullOrEmpty(path) || !File.Exists(path))
+				return $"{tool}: not found";
+			try {
+				using var process = new Process {
+					StartInfo = new ProcessStartInfo {
+						FileName = path,
+						Arguments = "-version",
+						CreateNoWindow = true,
+						RedirectStandardOutput = true,
+						RedirectStandardError = true,
+						UseShellExecute = false,
+						WindowStyle = ProcessWindowStyle.Hidden
+					}
+				};
+				process.Start();
+				string firstLine = process.StandardOutput.ReadLine() ?? string.Empty;
+				process.StandardOutput.ReadToEnd(); // drain so the process can exit cleanly
+				process.WaitForExit(5000);
+				return firstLine.Length > 0 ? firstLine : $"{tool}: no version output";
+			}
+			catch (Exception e) {
+				return $"{tool}: {e.GetType().Name}: {e.Message}";
+			}
+		}
+
 		internal static string LongPathFix(string path) {
 			if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+				return path;
+			if (path.StartsWith("\\\\?\\")) //already extended-length
+				return path;
+			if (path.Length < WindowsMaxPath)
 				return path;
 			//Check if path is UNC, see https://github.com/0x90d/videoduplicatefinder/issues/443
 			if (path.StartsWith('\\'))
